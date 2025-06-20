@@ -14,8 +14,8 @@ type Syllable struct {
 	Text string
 }
 
-// 解析一行 lrc，支援 syllable 和普通格式
 func parseLine(line string) ([]Syllable, error) {
+	// 用正則取出所有 <mm:ss.xx> 文字組合
 	if strings.Contains(line, "<") {
 		re := regexp.MustCompile(`<(\d+):(\d+\.\d+)> ?([^<]+)`)
 		matches := re.FindAllStringSubmatch(line, -1)
@@ -24,9 +24,12 @@ func parseLine(line string) ([]Syllable, error) {
 			min, _ := strconv.Atoi(match[1])
 			sec, _ := strconv.ParseFloat(match[2], 64)
 			text := match[3]
+
+			// 去除文字中可能的 [mm:ss.xx]
+			cleanText := regexp.MustCompile(`\[\d+:\d+\.\d+\]`).ReplaceAllString(text, "")
 			result = append(result, Syllable{
 				Time: float64(min)*60 + sec,
-				Text: strings.TrimSpace(text),
+				Text: strings.TrimSpace(cleanText),
 			})
 		}
 		return result, nil
@@ -39,15 +42,17 @@ func parseLine(line string) ([]Syllable, error) {
 		min, _ := strconv.Atoi(match[1])
 		sec, _ := strconv.ParseFloat(match[2], 64)
 		text := match[3]
+
+		// 去除文字中可能的 [mm:ss.xx]
+		cleanText := regexp.MustCompile(`\[\d+:\d+\.\d+\]`).ReplaceAllString(text, "")
 		return []Syllable{
-			{Time: float64(min)*60 + sec, Text: text},
+			{Time: float64(min)*60 + sec, Text: strings.TrimSpace(cleanText)},
 		}, nil
 	}
 
 	return nil, nil
 }
 
-// 格式化 ASS 時間格式: h:mm:ss.cs
 func formatASSTime(sec float64) string {
 	h := int(sec) / 3600
 	m := (int(sec) % 3600) / 60
@@ -56,29 +61,30 @@ func formatASSTime(sec float64) string {
 	return fmt.Sprintf("%d:%02d:%02d.%02d", h, m, s, cs)
 }
 
-// Karaoke 文字格式產生器，會用 {\kNN} 標記，NN是每字持續時間(百分之一秒)
-func karaokeFormat(text string, durationCS int) string {
-	if len(text) == 0 {
+// 根據前後時間與歌詞字數計算每字高亮時長(單位是0.01秒)
+func buildKaraokeText(text string, start, end float64) string {
+	// ASS的{\k}是以0.01秒為單位的長度
+	durationCS := int((end - start) * 100) // 0.01秒為單位
+
+	// 將歌詞依字拆分（可依需求改成依詞）
+	chars := []rune(text)
+
+	if len(chars) == 0 {
 		return ""
 	}
-	// 平均分配每個字的持續時間
-	perChar := durationCS / len([]rune(text))
-	if perChar <= 0 {
+
+	// 平均分配每字時間長度
+	perChar := durationCS / len(chars)
+	if perChar == 0 {
 		perChar = 1
 	}
 
 	var sb strings.Builder
-	for _, r := range text {
-		sb.WriteString(fmt.Sprintf("{\\k%d}%c", perChar, r))
+	for _, ch := range chars {
+		sb.WriteString(fmt.Sprintf("{\\k%d}%c", perChar, ch))
 	}
+
 	return sb.String()
-}
-
-// 移除歌詞中的時間標記 [mm:ss.xx]
-var timeTagRe = regexp.MustCompile(`\[\d+:\d+\.\d+\]`)
-
-func cleanLyric(text string) string {
-	return timeTagRe.ReplaceAllString(text, "")
 }
 
 func main() {
@@ -104,23 +110,27 @@ func main() {
 	defer outf.Close()
 
 	writer := bufio.NewWriter(outf)
-
 	scanner := bufio.NewScanner(file)
-	var lines []Syllable
+
+	type Line struct {
+		Time float64
+		Text string
+	}
+
+	var lines []Line
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		sylls, err := parseLine(line)
-		if err != nil || len(sylls) == 0 {
+		time, text, err := parseLine(line)
+		if err != nil {
 			continue
 		}
-		// LRC 一行只取第一個 syllable，通常 LRC 不會一行多時間
-		lines = append(lines, sylls[0])
+		lines = append(lines, Line{Time: time, Text: text})
 	}
 
-	// ASS Header，字體大小改成 24 (原本通常是 36 太大)
+	// ASS header
 	header := `[Script Info]
-Title: Karaoke Converted from LRC
+Title: Converted from LRC to KTV style
 ScriptType: v4.00+
 PlayResX: 384
 PlayResY: 288
@@ -128,31 +138,39 @@ Timer: 100.0000
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,24,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1
+Style: Default,Arial,18,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `
 	writer.WriteString(header)
 
-	for i := 0; i < len(lines); i++ {
-		start := lines[i].Time
-		var end float64
+	for i, line := range lines {
+		var endTime float64
 		if i+1 < len(lines) {
-			end = lines[i+1].Time
+			endTime = lines[i+1].Time
 		} else {
-			end = start + 5.0
+			endTime = line.Time + 3.0 // 最後一句延長3秒
 		}
-		durationCS := int((end - start) * 100)
 
-		// 移除歌詞中時間標記，再產生 karaoke 格式
-		cleanText := cleanLyric(lines[i].Text)
-		lyric := karaokeFormat(cleanText, durationCS)
+		// 將換行 \n 轉 ASS 換行 \N
+		lyric := strings.ReplaceAll(line.Text, `\n`, `\N`)
 
-		startStr := formatASSTime(start)
-		endStr := formatASSTime(end)
+		// 先拆成多行（以 \N 分割）
+		parts := strings.Split(lyric, `\N`)
 
-		dialogue := fmt.Sprintf("Dialogue: 0,%s,%s,Default,,0,0,0,,%s\n", startStr, endStr, lyric)
+		var assTextParts []string
+		for _, part := range parts {
+			// 每一行用 buildKaraokeText 產生逐字高亮字串
+			assTextParts = append(assTextParts, buildKaraokeText(part, line.Time, endTime))
+		}
+		// 用 ASS 換行符號連接多行
+		finalText := strings.Join(assTextParts, `\N`)
+
+		startStr := formatASSTime(line.Time)
+		endStr := formatASSTime(endTime)
+
+		dialogue := fmt.Sprintf("Dialogue: 0,%s,%s,Default,,0,0,0,,%s\n", startStr, endStr, finalText)
 		writer.WriteString(dialogue)
 	}
 
