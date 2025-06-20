@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	// "golang.org/x/text"
 )
 
 type Syllable struct {
@@ -121,11 +122,16 @@ func main() {
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		time, text, err := parseLine(line)
-		if err != nil {
+		syllables, err := parseLine(line)
+		if err != nil || len(syllables) == 0 {
 			continue
 		}
-		lines = append(lines, Line{Time: time, Text: text})
+
+		text := ""
+		for _, syl := range syllables {
+			text = syl.Text
+		}
+		lines = append(lines, Line{Time: syllables[0].Time, Text: text})
 	}
 
 	// ASS header
